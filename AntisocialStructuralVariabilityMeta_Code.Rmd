@@ -1,0 +1,1112 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# 1. Load data and libraries
+```{r}
+library(tidyverse)
+library(metafor)
+
+#change this to where you have the aspd_funcs.r file stored
+source('...../aspd_funcs.r')
+
+df <- read_csv('/.....aspd_meta_170922_23studies.csv')
+```
+
+
+#  2. Clean data
+```{r}
+# Create study id column
+df$studyid <- paste(df$author, df$year, sep = "")
+
+# Drop empty rows
+df <- df %>% filter(!is.na(author))
+
+
+# Remove columns for erroneous regions 
+drops <- c('DMPFC', 'DLPFC', 'FrontalPole', 'InferFronCort','LatTempLobe','lingualgyrus', 'OccCort','Orbitofrontalcortex', 'PostCentGy', 'precuneus', 'superiorparietal','VMPFC','TempPole')
+for(region in drops){df <- df %>% select(-contains(region))}
+
+# make a new column that groups the more specific diagnoses into two
+patient_diagnoses <- c("ASPD+P","ASPD-P","VO","DBD+CU", "DBD-CU", "ASPD","ADHD+DBD", "ASPD+BPD" , "High-PCLR","Medium-PCLR","CD","CD(Y)","DBD MALE","DBD FEMALE" , "ASPD(violent)","VO (chronic)" , "VO (transient)", "DBD", "ASPD(deprived)", "ASPD (not deprived)")
+control_diagnoses <- c("HCA", "HCY","HCY MALE","HCY FEMALE","HC")
+a <- ifelse(df$Diagnosis %in% patient_diagnoses, 'patient', NA)
+b <- ifelse(df$Diagnosis %in% control_diagnoses, 'control', NA)
+df$diagnosis_grouped <- coalesce(a,b)
+
+df$accumbens_mn<-as.numeric(df$accumbens_mn)
+# combine left and right regions for instances where there are not overall values provides
+regions <- str_sub(unique(colnames(select(df,contains("mn_l"))[0,])), end=-6)
+r = 0.7
+for (region in regions){
+  df<-as.data.frame(df)
+  for (study in unique(df$studyid)){
+    single_study_df <- df %>% filter(studyid==study)
+    if (is.na(single_study_df[sprintf('%s_mn', region)][[1]]) & !is.na(single_study_df[sprintf('%s_mn_l', region)])){
+      df <- calc_bilat(study, region, r, df)
+    }
+  }
+}
+
+```
+
+
+
+
+# 3A. Run meta analysis- CVR
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'putamen')
+results_list <- list()
+
+# Run the metanalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we can calculate effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      t <-  control_df$amygdala_t
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='CVR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if any effect sizes are present
+  if(sum(!is.na(meta_df$yi))>0){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study)
+  results_list[[region]] <- meta_results}
+  }
+
+
+#forest plot for an individual region
+indiv_forest <- function(dataframe, mytitle){
+  n <- dataframe$k
+  forest(dataframe,xlab = ("Greater in controls         CVR         Greater in patients"))
+  text(0, n+2, pos=1, mytitle)
+}
+
+indiv_forest(results_list$gray_matter, "gray_matter")
+
+# publication bias for individual region
+funnel(results_list$gray_matter)
+regtest(results_list$gray_matter)
+trimfill(results_list$gray_matter)
+ 
+### carry out trim-and-fill analysis
+taf <- trimfill(results_list$gray_matter)
+ 
+### draw funnel plot with missing studies filled in
+funnel(taf, legend=TRUE)
+meta_result <- results_list[['gray_matter']]
+
+#egger's
+regtest(results_list$gray_matter)
+meta_results$
+
+#p_value
+meta_result <- results_list[['gray_matter']]
+meta_result$pval
+
+```
+
+
+
+# 3B. Run meta analysis- SMD
+ctrl+shift+m for %>% 
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'accumbens', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'pallidum', 'putamen')
+results_list <- list()
+
+# Run the metanalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we can calculate effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      t <-  control_df$amygdala_t
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='SMD', data=meta_df)
+  
+  # Calculate effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if any effect sizes are present
+  if(sum(!is.na(meta_df$yi))>0){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study)
+  results_list[[region]] <- meta_results}
+  }
+
+
+#forest plot for an individual region
+indiv_forest <- function(dataframe, mytitle){
+  n <- dataframe$k
+  forest(dataframe,xlab = ("Greater in controls         SMD         Greater in patients"))
+  text(0, n+2, pos=1, mytitle)
+}
+
+
+
+indiv_forest(results_list$intracranial, "intracranial")
+
+# publication bias for individual region
+funnel(results_list$intracranial)
+regtest(results_list$intracranial)
+trimfill(results_list$intracranial)
+
+### carry out trim-and-fill analysis
+taf <- trimfill(results_list$intracranial)
+
+### draw funnel plot with missing studies filled in
+funnel(taf, legend=TRUE)
+meta_result <- results_list[['intracranial']]
+
+#egger's
+regtest(results_list$intracranial)
+meta_results$
+
+#p_value
+meta_result <- results_list[['intracranial']]
+meta_result$pval
+
+
+```
+
+
+
+
+# 3C. Run meta analysis- VR
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'hippocampus', 'accumbens', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'pallidum', 'putamen')
+results_list <- list()
+
+# Run the metanalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we can calculate effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      t <-  control_df$amygdala_t
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='VR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if any effect sizes are present
+  if(sum(!is.na(meta_df$yi))>0){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study)
+  results_list[[region]] <- meta_results}
+  }
+
+
+
+#forest plot for an individual region
+indiv_forest <- function(dataframe, mytitle){
+  n <- dataframe$k
+  forest(dataframe,xlab = ("Greater in controls         VR         Greater in patients"))
+  text(0, n+2, pos=1, mytitle)
+}
+
+
+
+indiv_forest(results_list$gray_matter, "gray_matter")
+
+# publication bias for individual region
+funnel(results_list$gray_matter)
+regtest(results_list$gray_matter)
+trimfill(results_list$gray_matter)
+
+### carry out trim-and-fill analysis
+taf <- trimfill(results_list$gray_matter)
+
+### draw funnel plot with missing studies filled in
+funnel(taf, legend=TRUE)
+meta_result <- results_list[['gray_matter']]
+
+#egger's
+regtest(results_list$gray_matter)
+meta_results$
+
+#p_value
+meta_result <- results_list[['gray_matter']]
+meta_result$pval
+
+
+```
+
+
+
+
+
+
+
+
+
+#4C_METAREGRESSION_IQ_CVR
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'putamen')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), iq=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_iq <- (n1*patient_df[1,]$IQ+n2*patient_df[2,]$IQ)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_iq <- patient_df$IQ
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_iq <- control_df$IQ
+      t <-  control_df$amygdala_t
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, iq=control_iq/patient_iq)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='CVR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 iq studies present
+  if(sum(!is.na(meta_df$iq))>2){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = iq)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['whole_brain']]
+metafor::regplot(results_list[['whole_brain']])
+```
+
+
+
+
+
+#4B_METAREGRESSION_IQ_SMD
+
+```{r}
+
+# List of brain regions we want to look at
+regions <-  c('whole_brain','intracranial', 'gray_matter', 'white_matter', 'csf', 'acc','accumbens', 'amygdala', 'caudate', 'cerebellum', 'corpus_callosum', 'frontal', 'frontal', 'hippocampus', 'insula', 'lateral_ventricle', 'pallidum', 'parahippocampal', 'parietal', 'putamen', 'striatum', 'thalamus', 'third_ventricle')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), iq=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    
+    
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_iq <- (n1*patient_df[1,]$IQ+n2*patient_df[2,]$IQ)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_iq <- patient_df$IQ
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_iq <- control_df$IQ
+      t <-  control_df$amygdala_t
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, iq=control_iq/patient_iq)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='SMD', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 iq studies present
+  if(sum(!is.na(meta_df$iq))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = iq)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['whole_brain']]
+metafor::regplot(results_list[['whole_brain']])
+```
+
+
+
+
+
+
+
+
+#4C_METAREGRESSION_IQ_VR
+
+```{r}
+# List of brain regions we want to look at
+regions <-  c('whole_brain','intracranial', 'gray_matter', 'white_matter', 'csf', 'acc','accumbens', 'amygdala', 'caudate', 'cerebellum', 'corpus_callosum', 'frontal', 'frontal', 'hippocampus', 'insula', 'lateral_ventricle', 'pallidum', 'parahippocampal', 'parietal', 'putamen', 'striatum', 'thalamus', 'third_ventricle')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), iq=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_iq <- (n1*patient_df[1,]$IQ+n2*patient_df[2,]$IQ)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_iq <- patient_df$IQ
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_iq <- control_df$IQ
+      t <-  control_df$amygdala_t
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, iq=control_iq/patient_iq)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='VR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 iq studies present
+  if(sum(!is.na(meta_df$iq))>2){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = iq)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['amygdala']]
+metafor::regplot(results_list[['amygdala']])
+```
+
+
+
+
+
+
+
+#4E_METAREGRESSION_AGE_CVR
+
+```{r}
+# List of brain regions we want to look at
+regions <-  c('whole_brain','intracranial', 'gray_matter', 'white_matter', 'csf', 'acc','accumbens', 'amygdala', 'caudate', 'cerebellum', 'corpus_callosum', 'frontal', 'frontal', 'hippocampus', 'insula', 'lateral_ventricle', 'pallidum', 'parahippocampal', 'parietal', 'putamen', 'striatum', 'thalamus', 'third_ventricle')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), age=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_age <- (n1*patient_df[1,]$age+n2*patient_df[2,]$age)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_age <- patient_df$age
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_age <- control_df$age
+      t <-  control_df$amygdala_t
+      combined_age <- (control_age * control_n + patient_age * patient_n)/(patient_n + control_n)
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, age=combined_age)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='CVR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 age studies present
+  if(sum(!is.na(meta_df$age))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = age)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['whole_brain']]
+metafor::regplot(results_list[['whole_brain']])
+```
+
+
+
+
+
+
+#4F_METAREGRESSION_AGE_SMD
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'accumbens', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'pallidum', 'putamen')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), age=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_age <- (n1*patient_df[1,]$age+n2*patient_df[2,]$age)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_age <- patient_df$age
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_age <- control_df$age
+      t <-  control_df$amygdala_t
+      combined_age <- (control_age * control_n + patient_age * patient_n)/(patient_n + control_n)
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, age=control_age/patient_age)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='CVR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 age studies present
+  if(sum(!is.na(meta_df$age))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = age)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['gray_matter']]
+metafor::regplot(results_list[['gray_matter']])
+
+```
+
+
+
+
+
+#4G_METAREGRESSION_AGE_VR
+
+```{r}
+# List of brain regions we want to look at
+regions <-  c('whole_brain','intracranial', 'gray_matter', 'white_matter', 'csf', 'acc','accumbens', 'amygdala', 'caudate', 'cerebellum', 'corpus_callosum', 'frontal', 'frontal', 'hippocampus', 'insula', 'lateral_ventricle', 'pallidum', 'parahippocampal', 'parietal', 'putamen', 'striatum', 'thalamus', 'third_ventricle')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), age=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_age <- (n1*patient_df[1,]$age+n2*patient_df[2,]$age)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_age <- patient_df$age
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_age <- control_df$age
+      t <-  control_df$amygdala_t
+      combined_age <- (control_age * control_n + patient_age * patient_n)/(patient_n + control_n)
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, age=combined_age)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='VR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 age studies present
+  if(sum(!is.na(meta_df$age))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = age)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['frontal']]
+metafor::regplot(results_list[['frontal']])
+
+
+#CALCULATE BY GROUP
+df %>% ggplot(aes(x=age, y=var, color=df.diagnosis_grouped,fill=df.diagnosis_grouped))+geom_point()+geom_smooth(method='lm')+theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+#5A_METAREGRESSION_ETHNICITY_CVR
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'accumbens', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'pallidum', 'putamen')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), white_ethnicity=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_white_ethnicity <- (n1*patient_df[1,]$white_ethnicity+n2*patient_df[2,]$white_ethnicity)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_white_ethnicity <- patient_df$white_ethnicity
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_white_ethnicity <- control_df$white_ethnicity
+      t <-  control_df$amygdala_t
+      combined_white_ethnicity <- (control_white_ethnicity * control_n + patient_white_ethnicity * patient_n)/(patient_n + control_n)
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, white_ethnicity= combined_white_ethnicity)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='CVR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 white_ethnicity studies present
+  if(sum(!is.na(meta_df$white_ethnicity))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = white_ethnicity)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['amygdala']]
+metafor::regplot(results_list[['amygdala']])
+
+```
+
+
+
+
+#5B_METAREGRESSION_ETHNICITY_SMD
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'accumbens', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'pallidum', 'putamen')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), white_ethnicity=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_white_ethnicity <- (n1*patient_df[1,]$white_ethnicity+n2*patient_df[2,]$white_ethnicity)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_white_ethnicity <- patient_df$white_ethnicity
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_white_ethnicity <- control_df$white_ethnicity
+      t <-  control_df$amygdala_t
+      combined_white_ethnicity <- (control_white_ethnicity * control_n + patient_white_ethnicity * patient_n)/(patient_n + control_n)
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, white_ethnicity= combined_white_ethnicity)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='SMD', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 white_ethnicity studies present
+  if(sum(!is.na(meta_df$white_ethnicity))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = white_ethnicity)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['whole_brain']]
+metafor::regplot(results_list[['whole_brain']])
+
+```
+
+
+
+
+
+#5C_METAREGRESSION_ETHNICITY_VR
+
+```{r}
+# List of brain regions we want to look at
+regions <- c('whole_brain', 'intracranial','white_matter', 'gray_matter', 'csf', 'accumbens', 'frontal','amygdala', 'caudate', 'cerebellum', 'frontal', 'hippocampus', 'pallidum', 'putamen')
+results_list <- list()
+
+# Rune the metannalyses for all these regions
+for(region in regions){
+   region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]))
+  # include t columns if these exist 
+  if(paste0(region, '_t') %in% colnames(df)){
+    region_df <- df %>% filter(!is.na(.[[paste0(region, '_mn')]]) | !is.na(.[[paste0(region, '_t')]]))}
+  
+
+  
+  # get a dataframe that we cann calcualte effect sizes for
+  meta_df <- data.frame(study=character(), pt_n=numeric(), con_n=numeric(), pt_mn=numeric(), pt_sd=numeric(), con_mn=numeric(), con_sd=numeric(), t=numeric(), dval=numeric(), white_ethnicity=numeric())
+  
+  for (study in unique(region_df$studyid)){
+    single_study_df<- region_df %>% filter(studyid==study)
+    patient_df <- single_study_df %>% filter(diagnosis_grouped=='patient')
+    control_df <- single_study_df %>% filter(diagnosis_grouped=='control')
+    no_pt_rows <- nrow(patient_df)
+    # this bit is to combine the cases where two patient groups
+    if (no_pt_rows==2){
+      n1 <- patient_df[1,]$n
+      n2 <-  patient_df[2,]$n
+      m1 <- patient_df[1,][[paste0(region,'_mn')]]
+      m2 <- patient_df[2,][[paste0(region,'_mn')]]
+      sd1 <- patient_df[1,][[paste0(region,'_sd')]]
+      sd2 <- patient_df[2,][[paste0(region,'_sd')]]
+      patient_n <- n1+n2
+      patient_mn <-(m1*n1+m2*n2)/(n1+n2)
+      patient_sd <- (((n1-1)*sd1^2+(n2-1)*sd2^2+n1*(sd1-patient_mn)^2+n2*(sd2-patient_mn)^2)/(n1+n2-1)^2)^0.5
+      patient_white_ethnicity <- (n1*patient_df[1,]$white_ethnicity+n2*patient_df[2,]$white_ethnicity)/(n1+n2)
+    }else{
+      patient_mn <- patient_df[[paste0(region,'_mn')]]
+      patient_sd <- patient_df[[paste0(region,'_sd')]]
+      patient_n <- patient_df$n
+      patient_white_ethnicity <- patient_df$white_ethnicity
+    }
+      control_mn <- control_df[[paste0(region,'_mn')]]
+      control_sd <- control_df[[paste0(region,'_sd')]]
+      control_n <- control_df$n
+      control_white_ethnicity <- control_df$white_ethnicity
+      t <-  control_df$amygdala_t
+      combined_white_ethnicity <- (control_white_ethnicity * control_n + patient_white_ethnicity * patient_n)/(patient_n + control_n)
+      newrow <- data.frame(study=study, pt_n=patient_n, con_n=control_n, pt_mn=patient_mn, pt_sd=patient_sd, con_mn=control_mn, con_sd=control_sd, t=t, dval=NA, white_ethnicity= combined_white_ethnicity)
+      meta_df <- rbind(meta_df, newrow)
+  }
+  
+
+  
+  #calculate the effect size
+  meta_df <- escalc(n1i = pt_n, n2i = con_n, m1i = pt_mn, m2i = con_mn, sd1i = pt_sd, sd2i = con_sd, measure='VR', data=meta_df)
+  
+  # Calcualte effect size from t-values
+  meta_df$dval <- replmiss(meta_df$dval, with(meta_df, t * sqrt(1/con_n + 1/pt_n)))
+  meta_df$yi <- replmiss(meta_df$yi, with(meta_df, (1 - 3/(4*(con_n+pt_n-2) - 1)) * dval))
+  meta_df$vi <- replmiss(meta_df$vi, with(meta_df, 1/con_n+ 1/pt_n + yi^2/(2*(con_n+pt_n))))
+  
+  #run meta analysis if a3 white_ethnicity studies present
+  if(sum(!is.na(meta_df$white_ethnicity))>4){
+  meta_results <- rma.uni(meta_df, slab = meta_df$study, mods = white_ethnicity)
+  results_list[[region]] <- meta_results}
+}
+
+results_list[['amygdala']]
+metafor::regplot(results_list[['amygdala']])
+
+```
+
+
+
+
+
+
+
+
+#6. Forest Plot 
+
+```{r}
+# summary forest plot 
+
+to_include <- c('whole_brain', 'intracranial', 'gray_matter', 'white_matter', 'csf', 'frontal',  'amygdala', 'caudate', 'cerebellum',  'frontal', 'hippocampus', 'putamen')
+
+label1 <- c('Whole Brain', 'Intracranial', 'Gray Matter', 'White Matter', 'CSF', 'Frontal',  'Amygdala', 'Caudate', 'Cerebellum',  'Frontal', 'Hippocampus', 'Putamen')
+
+
+# create data frame
+len = numeric(length(to_include))
+graph_results <- data.frame(estimate=len, lb=len, ub=len, k=len, p=len)
+graph_results$label1 <- label1
+
+# fill data frame with meta results
+j=1
+for (indiv_meta in to_include){
+  graph_results$estimate[j]=results_list[[indiv_meta]]$b
+  graph_results$lb[j]=results_list[[indiv_meta]]$ci.lb
+  graph_results$ub[j]=results_list[[indiv_meta]]$ci.ub
+  graph_results$p[j]=results_list[[indiv_meta]]$pval
+  a <- as.character(results_list[[indiv_meta]]$slab) #this reduces the 'k' printed on the graph for instances where subsamples counted as separate studies
+  b <- substr( a, start = nchar(a) - 1 , stop = nchar(a)-1)
+  num_dups = sum(b==".")/2
+  graph_results$k[j]=as.integer(results_list[[indiv_meta]]$k)-num_dups
+  j=j+1
+}
+
+
+ggplot(data=graph_results) +
+        geom_pointrange( aes(x=label1, y=estimate,  ymin=lb, ymax=ub), position = position_dodge(width = 0.9)) + 
+        geom_hline(yintercept=0, lty=2) +  # add a dotted line at x=1 after flip
+        ylab("") +
+        xlab("")+
+        scale_y_continuous(position="right")+
+        theme_minimal() + # use a white background
+        theme(legend.position="none")+
+        theme(panel.background = element_rect(fill = NA, color = "grey"))+
+        theme(strip.text.x=element_text(angle =180, hjust = 0.5))+
+        theme(axis.text.x=element_text(angle = 90, hjust = 0.5))+
+        theme(axis.text.y = element_text(angle = 90, hjust=0.5))+
+        theme(strip.placement = 'outside')+
+        scale_color_grey()
+
+library(ggplot2)
+
+ggsave("/Users/John/Desktop/ASPD_META_ANALYSIS_LAPTOP/CVR_FOREST.png")
+
+
+
+
+        
+```
+
+
+
+
+
+
+
+
+
